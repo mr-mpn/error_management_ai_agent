@@ -1,0 +1,221 @@
+name: Deploy AI Agent Error Management
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+# No special permissions needed — authentication is done via env vars
+permissions:
+  contents: read
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#
+#   AWS_ACCESS_KEY_ID     — AWS IAM user access key ID
+#   AWS_SECRET_ACCESS_KEY — AWS IAM user secret access key
+#   TF_STATE_BUCKET       — S3 bucket name for Terraform remote state
+#   EXPECTED_API_KEY      — The correct API key stored in the Lambda env var
+#
+# The AWS credentials are injected as environment variables into every job.
+# Terraform and the AWS CLI pick them up automatically — no extra config needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+env:
+  AWS_REGION:            eu-west-1
+  TF_VERSION:            "1.9.0"
+  PYTHON_VERSION:        "3.12"
+  # ── AWS credentials — injected from GitHub Secrets into every job ──────────
+  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION:    eu-west-1  # used by AWS CLI; TF uses AWS_REGION above
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: Deploy the ValidateKey Lambda
+  # Output: function_arn, log_group_name (consumed by jobs 2 & 3)
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-lambda:
+    name: "1 · Deploy ValidateKey Lambda"
+    runs-on: ubuntu-latest
+
+    outputs:
+      function_arn:   ${{ steps.tf-outputs.outputs.function_arn }}
+      log_group_name: ${{ steps.tf-outputs.outputs.log_group_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false  # Required for reliable output capture
+
+      - name: Terraform Init
+        working-directory: Lambda/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        working-directory: Lambda/terraform
+        run: terraform validate
+
+      - name: Terraform Apply
+        working-directory: Lambda/terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="expected_key=${{ secrets.EXPECTED_API_KEY }}"
+
+      - name: Capture Terraform Outputs
+        id: tf-outputs
+        working-directory: Lambda/terraform
+        run: |
+          echo "function_arn=$(terraform output -raw function_arn)"     >> "$GITHUB_OUTPUT"
+          echo "log_group_name=$(terraform output -raw log_group_name)" >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: Build & Deploy the Strands Agent Lambda
+  # Input:  log_group_name from Job 1
+  # Output: agent_function_arn (consumed by Job 3)
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-ai-agent:
+    name: "2 · Build & Deploy Strands Agent Lambda"
+    runs-on: ubuntu-latest
+    needs: deploy-lambda
+
+    outputs:
+      agent_function_arn: ${{ steps.tf-outputs.outputs.agent_function_arn }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Build the Lambda deployment package with strands-agents installed.
+      # Copies main.py + the tools/ and config/ sub-packages into the zip.
+      - name: Build Lambda Package
+        working-directory: ai_agent
+        run: |
+          pip install --quiet -r requirements.txt -t package/
+          cp main.py package/
+          cp -r tools/   package/tools/
+          cp -r config/  package/config/
+          cd package
+          zip -r ../lambda_package.zip . --quiet
+          cd ..
+          echo "Package size: $(du -sh lambda_package.zip | cut -f1)"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ai_agent/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        working-directory: ai_agent/terraform
+        run: terraform validate
+
+      - name: Terraform Apply
+        working-directory: ai_agent/terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="validate_key_log_group_name=${{ needs.deploy-lambda.outputs.log_group_name }}"
+
+      - name: Capture Terraform Outputs
+        id: tf-outputs
+        working-directory: ai_agent/terraform
+        run: |
+          echo "agent_function_arn=$(terraform output -raw agent_function_arn)" >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3: Deploy the Step Function
+  # Input:  function_arn + log_group_name from Job 1
+  #         agent_function_arn from Job 2
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-step-function:
+    name: "3 · Deploy Step Function"
+    runs-on: ubuntu-latest
+    needs: [deploy-lambda, deploy-ai-agent]
+
+    outputs:
+      state_machine_arn: ${{ steps.tf-outputs.outputs.state_machine_arn }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: step_function/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        working-directory: step_function/terraform
+        run: terraform validate
+
+      - name: Terraform Apply
+        working-directory: step_function/terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="validate_key_function_arn=${{ needs.deploy-lambda.outputs.function_arn }}" \
+            -var="strands_agent_function_arn=${{ needs.deploy-ai-agent.outputs.agent_function_arn }}" \
+            -var="validate_key_log_group_name=${{ needs.deploy-lambda.outputs.log_group_name }}"
+
+      - name: Capture Terraform Outputs
+        id: tf-outputs
+        working-directory: step_function/terraform
+        run: |
+          echo "state_machine_arn=$(terraform output -raw state_machine_arn)" >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 4: Print deployment summary
+  # ───────────────────────────────────────────────────────────────────────────
+  deployment-summary:
+    name: "4 · Deployment Summary"
+    runs-on: ubuntu-latest
+    needs: [deploy-lambda, deploy-ai-agent, deploy-step-function]
+    if: always()
+
+    steps:
+      - name: Print Summary
+        run: |
+          echo "## Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ValidateKey Lambda | ${{ needs.deploy-lambda.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Strands Agent Lambda | ${{ needs.deploy-ai-agent.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Step Function | ${{ needs.deploy-step-function.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**State Machine ARN:** \`${{ needs.deploy-step-function.outputs.state_machine_arn }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Test Command" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+          echo "aws stepfunctions start-execution \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --state-machine-arn '${{ needs.deploy-step-function.outputs.state_machine_arn }}' \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --input '{\"api_key\": \"wrong-key-intentional-fail\"}'" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"

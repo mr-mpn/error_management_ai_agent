@@ -1,0 +1,3 @@
+# AWS Strands Agents SDK — provides the Agent class, @tool decorator,
+# and BedrockModel integration for the ReAct agent loop.
+strands-agents

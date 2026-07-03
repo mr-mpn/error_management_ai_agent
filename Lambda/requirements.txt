@@ -1,0 +1,2 @@
+# No external dependencies.
+# Uses only Python stdlib and boto3 (pre-installed in the Lambda Python 3.12 runtime).
