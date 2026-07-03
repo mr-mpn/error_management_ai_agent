@@ -1,6 +1,6 @@
 # AI Agent Error Management
 
-> **Purpose**: A demonstration of autonomous AI-driven error recovery using **AWS Step Functions**, **AWS Lambda**, and the **[AWS Strands Agents SDK](https://github.com/strands-agents/sdk-python)** with Claude on Bedrock.
+> A demonstration of autonomous AI-driven error recovery using **AWS Step Functions**, **AWS Lambda**, and the **[AWS Strands Agents SDK](https://github.com/strands-agents/sdk-python)** with Claude 3.5 Sonnet on Bedrock.
 
 ---
 
@@ -22,9 +22,9 @@ Step Function starts
 
 1. The Step Function is started with a **deliberately wrong** `api_key`.
 2. The ValidateKey Lambda rejects it, logs the correct expected key (demo only!), and fails.
-3. The Step Function's `Catch` block triggers the **Strands Agent Lambda**.
-4. The Strands agent runs a **ReAct loop**: reads CloudWatch logs → finds the correct key → calls `restart_step_function`.
-5. A new Step Function execution starts with the correct key and **succeeds**.
+3. The Step Function `Catch` block triggers the **Strands Agent Lambda**.
+4. The Strands agent runs a **ReAct loop**: reads CloudWatch logs → finds the correct key → restarts the Step Function.
+5. A new execution starts with the correct key and **succeeds**.
 
 ---
 
@@ -34,22 +34,29 @@ Step Function starts
 ai_agent_error_management/
 │
 ├── Lambda/                          # ValidateKey Lambda
-│   ├── main.py                      # Handler — validates api_key vs EXPECTED_KEY env var
+│   ├── main.py                      # Validates api_key vs EXPECTED_KEY env var; logs the correct key
 │   ├── requirements.txt
-│   └── terraform/                   # Terraform module
+│   └── terraform/
 │       ├── main.tf
 │       ├── variables.tf
 │       └── outputs.tf
 │
 ├── step_function/                   # Step Function State Machine
 │   └── terraform/
-│       ├── main.tf                  # ASL definition with Catch block
+│       ├── main.tf                  # ASL with Catch block → InvokeAIAgent state
 │       ├── variables.tf
 │       └── outputs.tf
 │
-├── ai_agent/                        # Strands Agent Lambda (the core AI component)
-│   ├── main.py                      # Strands Agent with 2 tools
+├── ai_agent/                        # Strands Agent Lambda (core AI component)
+│   ├── main.py                      # Lambda entry point — thin handler, wires everything together
 │   ├── requirements.txt             # strands-agents
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   └── recovery_tools.py        # @tool definitions: read_cloudwatch_logs, restart_step_function
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── model.py                 # BedrockModel instance
+│   │   └── prompts.py               # SYSTEM_PROMPT constant
 │   └── terraform/
 │       ├── main.tf
 │       ├── variables.tf
@@ -57,7 +64,7 @@ ai_agent_error_management/
 │
 └── .github/
     └── workflows/
-        └── deploy.yml               # GitHub Actions CI/CD pipeline
+        └── deploy.yml               # GitHub Actions CI/CD — 3 jobs in dependency order
 ```
 
 ---
@@ -67,62 +74,55 @@ ai_agent_error_management/
 | Tool | Version | Notes |
 |------|---------|-------|
 | Terraform | ≥ 1.5.0 | |
-| Python | 3.12 | For building the agent Lambda package |
-| AWS CLI | v2 | For manual testing |
+| Python | 3.12 | For building the agent Lambda package locally |
+| AWS CLI | v2 | For setup and manual testing |
+| GitHub CLI (`gh`) | latest | For setting GitHub Secrets from the terminal |
 | AWS account | — | Claude 3.5 Sonnet must be enabled in Bedrock (eu-west-1) |
 
 ---
 
-## AWS Setup
+## Setup
 
-### 1. Create the Terraform State S3 Bucket
+### 1. Enable Bedrock Model Access
+
+In the AWS console → **Amazon Bedrock → Model access** (eu-west-1), enable:
+- `Anthropic / Claude 3.5 Sonnet`
+
+### 2. Create the Terraform State S3 Bucket
 
 ```bash
-aws s3 mb s3://<your-tf-state-bucket> --region eu-west-1
+aws s3 mb s3://ai-agent-error-mgmt-tf-state --region eu-west-1
+
+# Enable versioning (recommended)
 aws s3api put-bucket-versioning \
-  --bucket <your-tf-state-bucket> \
+  --bucket ai-agent-error-mgmt-tf-state \
   --versioning-configuration Status=Enabled
 ```
 
-### 2. Enable Bedrock Model Access
+### 3. Set GitHub Secrets via `gh` CLI
 
-In the AWS console → **Amazon Bedrock → Model access** (eu-west-1), request access for:
-- `Anthropic / Claude 3.5 Sonnet`
+The CI/CD pipeline authenticates with AWS using `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` injected as environment variables. Set all 4 secrets from your terminal:
 
-### 3. Create GitHub Actions OIDC IAM Role
+```bash
+# Read your credentials from the local AWS CLI config and pipe them straight in
+gh secret set AWS_ACCESS_KEY_ID \
+  --body "$(aws configure get aws_access_key_id)"
 
-Create an IAM role trusted by GitHub Actions OIDC:
+gh secret set AWS_SECRET_ACCESS_KEY \
+  --body "$(aws configure get aws_secret_access_key)"
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": {
-        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-      },
-      "StringLike": {
-        "token.actions.githubusercontent.com:sub": "repo:<YOUR_GITHUB_ORG>/<YOUR_REPO>:*"
-      }
-    }
-  }]
-}
+gh secret set TF_STATE_BUCKET \
+  --body "ai-agent-error-mgmt-tf-state"
+
+gh secret set EXPECTED_API_KEY \
+  --body "super-secret-key-2024"
 ```
 
-Attach a policy granting permissions for: Lambda, IAM, S3 (state bucket), Step Functions, CloudWatch Logs, Bedrock.
+Verify all secrets are registered:
 
-### 4. Set GitHub Secrets
-
-In your GitHub repository → **Settings → Secrets and variables → Actions**:
-
-| Secret | Value |
-|--------|-------|
-| `AWS_DEPLOY_ROLE_ARN` | ARN of the OIDC IAM role created above |
-| `TF_STATE_BUCKET` | Name of your Terraform state S3 bucket |
-| `EXPECTED_API_KEY` | The correct API key (e.g., `my-secret-key-2024`) |
+```bash
+gh secret list
+```
 
 ---
 
@@ -130,13 +130,21 @@ In your GitHub repository → **Settings → Secrets and variables → Actions**
 
 ### Via GitHub Actions (CI/CD)
 
-Push to `main` — the pipeline runs automatically in 3 sequential jobs:
+Push to `main` — the pipeline deploys all 3 modules in dependency order:
 
 ```
-Job 1: Deploy ValidateKey Lambda
-Job 2: Build & Deploy Strands Agent Lambda
-Job 3: Deploy Step Function
+Job 1 → Deploy ValidateKey Lambda
+Job 2 → Build & Deploy Strands Agent Lambda   (needs Job 1 outputs)
+Job 3 → Deploy Step Function                  (needs Job 1 + 2 outputs)
 ```
+
+```bash
+git add .
+git commit -m "initial deployment"
+git push origin main
+```
+
+The **Job 4 summary** printed at the end of the pipeline gives you the State Machine ARN and a ready-to-run test command.
 
 ### Manual Deployment (local)
 
@@ -144,8 +152,8 @@ Job 3: Deploy Step Function
 
 ```bash
 cd Lambda/terraform
-terraform init -backend-config="bucket=<your-tf-state-bucket>"
-terraform apply -var="expected_key=<your-secret-key>"
+terraform init -backend-config="bucket=ai-agent-error-mgmt-tf-state"
+terraform apply -var="expected_key=super-secret-key-2024"
 ```
 
 #### Step 2 — Strands Agent Lambda
@@ -153,13 +161,15 @@ terraform apply -var="expected_key=<your-secret-key>"
 ```bash
 cd ai_agent
 
-# Build the deployment package
+# Build the deployment package (includes tools/ and config/ sub-packages)
 pip install -r requirements.txt -t package/
 cp main.py package/
+cp -r tools/  package/tools/
+cp -r config/ package/config/
 cd package && zip -r ../lambda_package.zip . && cd ..
 
 cd terraform
-terraform init -backend-config="bucket=<your-tf-state-bucket>"
+terraform init -backend-config="bucket=ai-agent-error-mgmt-tf-state"
 terraform apply \
   -var="validate_key_log_group_name=$(cd ../../Lambda/terraform && terraform output -raw log_group_name)"
 ```
@@ -168,7 +178,7 @@ terraform apply \
 
 ```bash
 cd step_function/terraform
-terraform init -backend-config="bucket=<your-tf-state-bucket>"
+terraform init -backend-config="bucket=ai-agent-error-mgmt-tf-state"
 terraform apply \
   -var="validate_key_function_arn=$(cd ../../Lambda/terraform && terraform output -raw function_arn)" \
   -var="strands_agent_function_arn=$(cd ../../ai_agent/terraform && terraform output -raw agent_function_arn)" \
@@ -182,12 +192,11 @@ terraform apply \
 ### 1. Get the State Machine ARN
 
 ```bash
-cd step_function/terraform
-SF_ARN=$(terraform output -raw state_machine_arn)
+SF_ARN=$(cd step_function/terraform && terraform output -raw state_machine_arn)
 echo $SF_ARN
 ```
 
-### 2. Start an Execution with the WRONG Key (triggers failure + AI recovery)
+### 2. Trigger a failure (wrong key → AI recovery)
 
 ```bash
 aws stepfunctions start-execution \
@@ -196,25 +205,20 @@ aws stepfunctions start-execution \
   --region eu-west-1
 ```
 
-### 3. Watch the Execution
+### 3. Watch the Strands agent work in real time
 
-```bash
-# Poll execution status
-aws stepfunctions describe-execution \
-  --execution-arn "<execution-arn-from-step-2>" \
-  --region eu-west-1
-```
-
-### 4. Verify Recovery
-
-After ~30-60 seconds you should see:
-- Execution 1 (with wrong key): status `SUCCEEDED` — the `InvokeAIAgent` state completed
-- A new Execution 2 (with correct key): status `SUCCEEDED` — started by the AI agent
-
-Check the Strands Agent Lambda logs in CloudWatch for the full agent trace:
 ```bash
 aws logs tail /aws/lambda/ai-agent-strands-error-recovery --follow --region eu-west-1
 ```
+
+### 4. Verify recovery
+
+After ~30–60 seconds you should see two executions in the AWS console:
+
+| Execution | Input | Status |
+|-----------|-------|--------|
+| Execution 1 | `wrong-key-intentional-fail` | `SUCCEEDED` (InvokeAIAgent state completed) |
+| Execution 2 | `super-secret-key-2024` | `SUCCEEDED` (started by the AI agent) |
 
 ---
 
@@ -222,32 +226,30 @@ aws logs tail /aws/lambda/ai-agent-strands-error-recovery --follow --region eu-w
 
 ### Strands SDK ReAct Loop
 
-The agent uses the **Strands Agents SDK** which implements the [ReAct (Reason + Act)](https://arxiv.org/abs/2210.03629) pattern:
-
 ```
 Thought → which tool do I need?
 Act     → call the tool
 Observe → read the result
 Thought → what should I do next?
-... repeat until task complete
+          ... repeat until done
 ```
 
 ### Tools
 
-| Tool | Purpose |
-|------|---------|
-| `read_cloudwatch_logs` | Calls `logs:FilterLogEvents` on the ValidateKey Lambda's log group. Returns all recent messages, including the line with the correct key. |
-| `restart_step_function` | Calls `states:StartExecution` with the correct `api_key` to relaunch the workflow. |
+| Tool | File | What it does |
+|------|------|-------------|
+| `read_cloudwatch_logs` | `tools/recovery_tools.py` | Calls `logs:FilterLogEvents` — returns all recent log events including the correct key |
+| `restart_step_function` | `tools/recovery_tools.py` | Calls `states:StartExecution` with the correct `api_key` extracted from the logs |
 
-### System Prompt Key Instructions
+### Agent Configuration
 
-The agent is instructed to:
-1. Read logs and find the line: `[KEY_VALIDATION] Expected API key: <value>`
-2. Extract the key value precisely
-3. Call `restart_step_function` with that key
-4. Report the outcome
+| Item | File | Value |
+|------|------|-------|
+| Model | `config/model.py` | `anthropic.claude-3-5-sonnet-20241022-v2:0` |
+| System prompt | `config/prompts.py` | Instructs the agent to read logs → extract key → restart |
+| Agent wiring | `main.py` | Instantiates `Agent(model, tools, system_prompt)` |
 
-> **⚠️ Demo Note**: Logging the expected key in CloudWatch is **intentionally insecure** for demonstration purposes. In a real system, the correct action would be fetched from AWS Secrets Manager or SSM Parameter Store.
+> **⚠️ Demo Note**: Logging the expected key in CloudWatch is **intentionally insecure** for demonstration purposes only. In production, the correct key would be fetched from AWS Secrets Manager or SSM Parameter Store.
 
 ---
 
@@ -257,15 +259,16 @@ The agent is instructed to:
 |-----------|-------------|
 | ValidateKey Lambda | `logs:CreateLogStream`, `logs:PutLogEvents` (own log group) |
 | Strands Agent Lambda | `bedrock:InvokeModel`, `logs:FilterLogEvents` (ValidateKey log group), `states:StartExecution` |
-| Step Function | `lambda:InvokeFunction` (both Lambda ARNs) |
+| Step Function | `lambda:InvokeFunction` (ValidateKey + Strands Agent ARNs) |
 
 ---
 
 ## Teardown
 
+Destroy in reverse dependency order:
+
 ```bash
-# Destroy in reverse dependency order
 cd step_function/terraform && terraform destroy -auto-approve
-cd ai_agent/terraform      && terraform destroy -auto-approve
-cd Lambda/terraform        && terraform destroy -auto-approve
+cd ../../ai_agent/terraform && terraform destroy -auto-approve
+cd ../../Lambda/terraform   && terraform destroy -auto-approve
 ```

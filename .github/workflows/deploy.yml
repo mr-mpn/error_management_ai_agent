@@ -33,12 +33,38 @@ env:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
+  # Job 0: Create the S3 bucket for Terraform state if it does not exist yet
+  # All deploy jobs depend on this so the bucket is guaranteed to exist.
+  # ───────────────────────────────────────────────────────────────────────────
+  setup-state-bucket:
+    name: "0 · Create Terraform State Bucket"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create S3 bucket if it does not exist
+        run: |
+          if aws s3api head-bucket --bucket "${{ secrets.TF_STATE_BUCKET }}" 2>/dev/null; then
+            echo "Bucket ${{ secrets.TF_STATE_BUCKET }} already exists — skipping creation."
+          else
+            echo "Bucket not found — creating ${{ secrets.TF_STATE_BUCKET }}..."
+            aws s3api create-bucket \
+              --bucket "${{ secrets.TF_STATE_BUCKET }}" \
+              --region "${{ env.AWS_REGION }}" \
+              --create-bucket-configuration LocationConstraint="${{ env.AWS_REGION }}"
+            aws s3api put-bucket-versioning \
+              --bucket "${{ secrets.TF_STATE_BUCKET }}" \
+              --versioning-configuration Status=Enabled
+            echo "Bucket created and versioning enabled."
+          fi
+
+  # ───────────────────────────────────────────────────────────────────────────
   # Job 1: Deploy the ValidateKey Lambda
   # Output: function_arn, log_group_name (consumed by jobs 2 & 3)
   # ───────────────────────────────────────────────────────────────────────────
   deploy-lambda:
     name: "1 · Deploy ValidateKey Lambda"
     runs-on: ubuntu-latest
+    needs: setup-state-bucket
 
     outputs:
       function_arn:   ${{ steps.tf-outputs.outputs.function_arn }}
@@ -86,7 +112,7 @@ jobs:
   deploy-ai-agent:
     name: "2 · Build & Deploy Strands Agent Lambda"
     runs-on: ubuntu-latest
-    needs: deploy-lambda
+    needs: [setup-state-bucket, deploy-lambda]
 
     outputs:
       agent_function_arn: ${{ steps.tf-outputs.outputs.agent_function_arn }}
@@ -151,7 +177,7 @@ jobs:
   deploy-step-function:
     name: "3 · Deploy Step Function"
     runs-on: ubuntu-latest
-    needs: [deploy-lambda, deploy-ai-agent]
+    needs: [setup-state-bucket, deploy-lambda, deploy-ai-agent]
 
     outputs:
       state_machine_arn: ${{ steps.tf-outputs.outputs.state_machine_arn }}
