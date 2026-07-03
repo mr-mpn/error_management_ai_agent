@@ -11,9 +11,9 @@ variable "function_name" {
 }
 
 variable "bedrock_model_id" {
-  description = "Bedrock foundation model ID used by the Strands agent."
+  description = "Bedrock model ID for the Strands agent. Uses eu. prefix for cross-region inference in eu-west-1."
   type        = string
-  default     = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+  default     = "eu.amazon.nova-pro-v1:0"
 }
 
 variable "validate_key_log_group_name" {

@@ -94,8 +94,12 @@ resource "aws_iam_role_policy" "strands_agent" {
           "bedrock:InvokeModel",
           "bedrock:InvokeModelWithResponseStream",
         ]
-        # Scoped to the specific model configured for this agent
-        Resource = "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/${var.bedrock_model_id}"
+        # Allow both foundation model ARNs and cross-region inference profile ARNs.
+        # eu-west-1 requires the eu. prefixed inference profile (different ARN format).
+        Resource = [
+          "arn:aws:bedrock:*::foundation-model/*",
+          "arn:aws:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:inference-profile/*",
+        ]
       },
 
       # ── Start new Step Function execution (tool: restart_step_function) ─────

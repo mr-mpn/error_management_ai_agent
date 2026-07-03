@@ -9,10 +9,11 @@ import os
 
 from strands.models.bedrock import BedrockModel
 
-# Model ID defaults to Claude 3.5 Sonnet; can be overridden via env var.
+# Amazon Nova Pro — AWS's own foundation model with strong tool-use support.
+# Uses the eu. cross-region inference profile prefix required in eu-west-1.
 BEDROCK_MODEL_ID: str = os.environ.get(
     "BEDROCK_MODEL_ID",
-    "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "eu.amazon.nova-pro-v1:0",
 )
 
 bedrock_model = BedrockModel(
